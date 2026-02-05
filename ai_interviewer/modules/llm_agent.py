@@ -1,97 +1,123 @@
+# llm_agent.py
 import os
 import re
+from typing import Generator, Dict, List, Any
 from openai import OpenAI
 
-import json
+# API配置
+api_key = os.getenv("DEEPSEEK_API_KEY", "sk-4922e9d067814b109ee7663fffee442e")
+client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
 
-api_key = os.getenv("API_KEY", "sk-7040bb4394684465b0f62f3063dbe9cc")
+def clean_text(text: str, max_len: int = 1500) -> str:
+    
+    if not text or not text.strip():
+        return ""
+    
+    text = text.strip()
+    if len(text) > max_len:
+        text = text[:max_len]
+    
+    
+    text = text.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
+    
+    return text
 
-client = OpenAI(
-    api_key=api_key,
-    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-)
-
-
-#岗位输入检查
-def clean_position_input(position_input):
-    if not position_input or not position_input.strip():
-        return False, "", "岗位名称不能为空"
-    
-    position = position_input.strip()
-    
-    if len(position) > 30:
-        position = position[:30]
-    
-    position = re.sub(r'[^\u4e00-\u9fa5a-zA-Z0-9\s\-_()（）]', '', position)
-    
-    injection_patterns = [
-        r'```.*?```',  
-        r'你.*?现在.*?是',
-        r'忽略.*?之前',
-    ]
-    for pattern in injection_patterns:
-        position = re.sub(pattern, '', position, flags=re.IGNORECASE)
-    
-    escape_map = {
-        '"': "'",
-        '\n': ' ',
-        '\r': ' ',
-        '\t': ' ',
-    }
-    
-    for char, replacement in escape_map.items():
-        position = position.replace(char, replacement)
-    
-    position = position.strip()
-    if not position:
-        return False, "", "岗位名称无效"
-    
-    return True, position, ""
-
-#管理历史记录
-def manage_history(history, max_length=6):
+def manage_history(history: List[Dict], max_length: int = 6) -> List[Dict]:
+    """管理对话历史，保持合理长度"""
     if len(history) <= max_length:
         return history.copy()
     
     new_history = []
-    
     for msg in history:
         if msg.get("role") == "system":
             new_history.append(msg)
             break
     
     recent_count = max_length - len(new_history)
-    recent_history = history[-recent_count:]
-    
-    # 合并
-    if new_history:
-        new_history.extend(recent_history)
-    else:
-        new_history = recent_history
-    
-    return new_history
+    return new_history + history[-recent_count:]
 
-# 简单评估回答
-def evaluate_answer_simple(question, answer):
-    score = 3.0 
+def llm_stream_chat(
+    history: List[Dict],
+    user_input: str,
+    system_prompt: str = "",
+    model_name: str = "deepseek-chat",
+    temperature: float = 0.7,
+    max_tokens: int = 2000,
+    top_p: float = 0.9,
+    **extra_params
+) -> Generator[str, None, None]:
+    """
+    核心LLM函数：文字入，文字出
+    参数全部从app.py传入
+    """
+    # 清理输入
+    user_input = clean_text(user_input)
+    if not user_input:
+        yield "请输入有效内容"
+        return
+    
+    # 准备历史记录
+    history = manage_history(history)
+    messages = history.copy()
+    
+    # 添加系统提示（如果有）
+    if system_prompt and not any(msg.get("role") == "system" for msg in messages):
+        messages.insert(0, {"role": "system", "content": system_prompt})
+    
+    messages.append({"role": "user", "content": user_input})
+ 
+    try:
+        completion = client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            stream=True,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            **extra_params
+        )
+        
+        for chunk in completion:
+            if chunk.choices and chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
+                
+    except Exception as e:
+        yield f"抱歉，系统出了点问题: {str(e)}"
+
+def get_full_response(history: List[Dict], user_input: str, system_prompt: str = "") -> str:
+    """获取完整响应（非流式）"""
+    response = ""
+    for chunk in llm_stream_chat(history, user_input, system_prompt):
+        response += chunk
+    return response
+
+def evaluate_answer(question: str, answer: str) -> Dict[str, Any]:
+    """评估回答质量"""
+    score = 3.0
+    
+    # 基于长度
     if len(answer) > 100:
         score += 0.5
     elif len(answer) < 30:
         score -= 1.0
     
-    tech_words = ["Python", "Java", "数据库", "算法", "优化", "框架"]
+    # 基于内容
+    tech_words = ["Python", "Java", "算法", "框架", "数据库", "优化", "模型"]
     for word in tech_words:
         if word in answer:
             score += 0.2
             break
-  
+    
     vague_words = ["不太清楚", "不了解", "大概", "可能"]
     for word in vague_words:
         if word in answer:
             score -= 0.3
             break
- 
+    
+    # 限制范围
     score = max(1.0, min(5.0, score))
+    
+    # 反馈
     if score >= 4.0:
         feedback = "回答详细，技术点清晰"
     elif score >= 3.0:
@@ -99,124 +125,21 @@ def evaluate_answer_simple(question, answer):
     else:
         feedback = "可以更详细一些"
     
-    return round(score, 1), feedback
+    return {"score": round(score, 1), "feedback": feedback}
 
-# 判断是否需要追问
-def should_followup_simple(answer, history_length):
-    if len(answer) < 50:
-        return True, "回答可以再详细一些吗？"
-    
-    vague_words = ["不太清楚", "不了解", "大概"]
-    for word in vague_words:
-        if word in answer:
-            return True, "能具体解释一下吗？"
-    
-    if history_length > 8:
-        return False, "继续下一个问题"
-    
-    return False, "回答足够详细"
-
-def get_interview_summary(position, questions_asked, scores):
-    """
-    生成简单的面试总结
-    """
+def get_summary(position: str, question_count: int, scores: List[float]) -> str:
+    """生成面试总结"""
     if not scores:
-        return "面试还没开始"
+        return "面试尚未开始"
     
     avg_score = sum(scores) / len(scores)
     
     summary = f"""
 面试结束！
 职位：{position}
-问题数量：{questions_asked}
+问题数量：{question_count}
 平均得分：{avg_score:.1f}/5.0
 
-{"表现不错，技术掌握扎实" if avg_score >= 4.0 else "基本掌握，还有提升空间"}
-    """
-    
-    return summary
-
-# 主函数
-def llm_stream_chat(history, user_input, interview_mode=False, position="Python开发", 
-                   followup_mode=False, evaluate_mode=False, **kwargs):
-    """
-    history: 对话历史
-    user_input: 用户输入
-    interview_mode: 面试模式
-    position: 面试职位
-    followup_mode: 追问模式
-    evaluate_mode: 评估模式（返回评估结果）
-    **kwargs: 模型参数
-    """
-    
-    # 输入检查
-    if not user_input or not user_input.strip():
-        if evaluate_mode:
-            return {"score": 0, "feedback": "无有效回答"}
-        yield "请说详细一点"
-        return
-
-    if len(user_input) > 1500:
-        user_input = user_input[:1500]
-    
-    if interview_mode and position:
-        is_valid, cleaned_position, _ = clean_position_input(position)
-        if not is_valid:
-            cleaned_position = "Python开发"
-    
-    history = manage_history(history)
-    messages = history.copy()
-    
-    if interview_mode:
-        safe_position = cleaned_position if 'cleaned_position' in locals() else position
-        
-        if followup_mode:
-            system_prompt = f"你是{safe_position}面试官，正在追问细节。"
-        elif evaluate_mode:
-            system_prompt = f"你是{safe_position}面试官，正在评估回答。"
-        else:
-            system_prompt = f"你是{safe_position}面试官，考察技术深度。"
-        
-        if not any(msg.get("role") == "system" for msg in messages):
-            messages.insert(0, {"role": "system", "content": system_prompt})
-    
-    # 评估模式
-    if evaluate_mode:
-        score, feedback = evaluate_answer_simple(messages[-2]["content"] if len(messages) > 1 else "", user_input)
-        yield {"score": score, "feedback": feedback}
-        return
-    
-    messages.append({"role": "user", "content": user_input})
-    
-    # 模型参数
-    model = kwargs.get('model', 'qwen-plus')
-    temperature = kwargs.get('temperature', 0.7)
-    max_tokens = kwargs.get('max_tokens', 2000)
-    top_p = kwargs.get('top_p', 0.9)
-    
-    # 流式输出
-    try:
-        completion = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            stream=True,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            top_p=top_p
-        )
-
-        full_response = ""
-        for chunk in completion:
-            if chunk.choices and chunk.choices[0].delta.content:
-                content = chunk.choices[0].delta.content
-                full_response += content
-                yield full_response
-
-    except Exception as e:
-        error_msg = str(e).lower()
-        if "timeout" in error_msg:
-            yield "思考中，请稍候..."
-        else:
-            yield f"抱歉，系统出了点问题: {str(e)}"
-
-
+{"表现优秀，专业扎实" if avg_score >= 4.0 else "基本合格，仍有提升空间"}
+"""
+    return summary.strip()
