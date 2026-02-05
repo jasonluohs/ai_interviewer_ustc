@@ -1,366 +1,294 @@
-"""
-音频处理模块 - 录音、转文字、沉默分析
-"""
-import wave
-import pyaudio
-import numpy as np
-from typing import Optional, Tuple, Dict
-import threading
-import queue
-import time
-import tempfile
 import os
+import tempfile
 
-from config import AUDIO_VIDEO_CONFIG
-from utils.logger import get_logger
+# 检查是否在魔搭社区
+IS_MODELSCOPE = os.getenv('MODELSCOPE_ENVIRONMENT', 'False') == 'True'
+print(f"当前环境：{'魔搭社区' if IS_MODELSCOPE else '本地'}")
 
-logger = get_logger(__name__)
-
-class AudioRecorder:
-    """音频录制器"""
-    
-    def __init__(self):
-        self.recording = False
-        self.frames = []
-        self.audio_thread = None
-        self.audio_queue = queue.Queue()
-        
-        self.chunk = 1024
-        self.format = pyaudio.paInt16
-        self.channels = 1
-        self.rate = AUDIO_VIDEO_CONFIG.sample_rate
-        
+def speech_to_text_simple(audio_path):
+    # 如果在魔搭社区，用魔搭的模型
+    if IS_MODELSCOPE:
         try:
-            self.audio = pyaudio.PyAudio()
-            logger.info("PyAudio初始化成功")
-        except Exception as e:
-            logger.error(f"PyAudio初始化失败: {e}")
-            self.audio = None
-    
-    def start_recording(self):
-        """开始录音"""
-        if not self.audio or self.recording:
-            return False
+            from modelscope.pipelines import pipeline
+            from modelscope.utils.constant import Tasks
             
-        self.recording = True
-        self.frames = []
-        
-        def record_callback():
-            stream = self.audio.open(
-                format=self.format,
-                channels=self.channels,
-                rate=self.rate,
-                input=True,
-                frames_per_buffer=self.chunk
+            print("使用魔搭语音识别模型...")
+            asr_pipeline = pipeline(
+                task=Tasks.auto_speech_recognition,
+                model='damo/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch'
             )
             
-            while self.recording:
-                try:
-                    data = stream.read(self.chunk, exception_on_overflow=False)
-                    self.frames.append(data)
-                    self.audio_queue.put(data)
-                except Exception as e:
-                    logger.error(f"录音错误: {e}")
-                    break
-            
-            stream.stop_stream()
-            stream.close()
-        
-        self.audio_thread = threading.Thread(target=record_callback)
-        self.audio_thread.start()
-        
-        logger.info("开始录音")
-        return True
-    
-    def stop_recording(self) -> Optional[bytes]:
-        """停止录音并返回音频数据"""
-        if not self.recording:
-            return None
-            
-        self.recording = False
-        
-        if self.audio_thread:
-            self.audio_thread.join(timeout=2)
-        
-        audio_data = b''.join(self.frames)
-        
-        logger.info(f"停止录音，获取 {len(audio_data)} 字节音频数据")
-        return audio_data
-    
-    def save_to_wav(self, audio_data: bytes, filename: str) -> bool:
-        """保存为WAV文件"""
-        try:
-            with wave.open(filename, 'wb') as wf:
-                wf.setnchannels(self.channels)
-                wf.setsampwidth(self.audio.get_sample_size(self.format))
-                wf.setframerate(self.rate)
-                wf.writeframes(audio_data)
-            
-            logger.info(f"音频已保存到: {filename}")
-            return True
-        except Exception as e:
-            logger.error(f"保存WAV文件失败: {e}")
-            return False
-    
-    def cleanup(self):
-        """清理资源"""
-        if self.audio:
-            self.audio.terminate()
-
-class SilenceAnalyzer:
-    """沉默分析器"""
-    
-    @staticmethod
-    def analyze_silence_patterns(audio_data: bytes, sample_rate: int = 16000) -> Dict:
-        """
-        分析音频中的沉默模式
-        返回沉默时长、比例、分布
-        """
-        if not audio_data:
-            return {
-                "silence_ratio": 0.0,
-                "total_silence_seconds": 0.0,
-                "silent_segments": [],
-                "long_silence_count": 0,
-                "speech_activity_percent": 0.0,
-                "audio_duration": 0.0
-            }
-        
-        try:
-            # 转换为numpy数组
-            audio_array = np.frombuffer(audio_data, dtype=np.int16)
-            
-            if len(audio_array) == 0:
-                return {
-                    "silence_ratio": 1.0,
-                    "total_silence_seconds": 0.0,
-                    "silent_segments": [],
-                    "long_silence_count": 0,
-                    "speech_activity_percent": 0.0,
-                    "audio_duration": 0.0
-                }
-            
-            # 计算能量
-            energy = np.abs(audio_array).astype(np.float32)
-            
-            # 沉默检测阈值
-            if len(energy) > 0:
-                silence_threshold = np.percentile(energy, 25)  # 能量最低的25%作为沉默基线
-                silence_threshold = max(silence_threshold, 100)  # 最小阈值
-            else:
-                silence_threshold = 100
-            
-            is_silence = energy < silence_threshold
-            
-            # 计算沉默比例
-            silence_ratio = np.mean(is_silence)
-            
-            # 找到沉默段
-            silent_segments = []
-            current_segment = []
-            
-            for i, silent in enumerate(is_silence):
-                if silent:
-                    current_segment.append(i)
-                elif current_segment:
-                    segment_duration = len(current_segment) / sample_rate
-                    if segment_duration > 0.5:  # 超过0.5秒的沉默
-                        start_time = current_segment[0] / sample_rate
-                        end_time = current_segment[-1] / sample_rate
-                        silent_segments.append({
-                            "start": round(start_time, 2),
-                            "end": round(end_time, 2),
-                            "duration": round(segment_duration, 2)
-                        })
-                    current_segment = []
-            
-            # 处理最后的沉默段
-            if current_segment:
-                segment_duration = len(current_segment) / sample_rate
-                if segment_duration > 0.5:
-                    start_time = current_segment[0] / sample_rate
-                    end_time = current_segment[-1] / sample_rate
-                    silent_segments.append({
-                        "start": round(start_time, 2),
-                        "end": round(end_time, 2),
-                        "duration": round(segment_duration, 2)
-                    })
-            
-            # 长沉默标记（>3秒）
-            long_silences = [s for s in silent_segments if s["duration"] > 3.0]
-            
-            # 计算语音活跃度
-            total_duration = len(audio_array) / sample_rate
-            if total_duration > 0:
-                speech_duration = total_duration - sum(s["duration"] for s in silent_segments)
-                speech_activity = (speech_duration / total_duration) * 100
-            else:
-                speech_activity = 0.0
-            
-            return {
-                "silence_ratio": round(float(silence_ratio), 3),
-                "total_silence_seconds": round(sum(s["duration"] for s in silent_segments), 2),
-                "silent_segments": silent_segments[:10],  # 只保留前10个
-                "long_silence_count": len(long_silences),
-                "speech_activity_percent": round(speech_activity, 1),
-                "audio_duration": round(total_duration, 2),
-                "silence_threshold": float(silence_threshold)
-            }
+            result = asr_pipeline(audio_path)
+            text = result.get('text', '')
+            print(f"识别结果：{text}")
+            return text
             
         except Exception as e:
-            logger.error(f"沉默分析失败: {e}")
-            return {
-                "silence_ratio": 0.0,
-                "total_silence_seconds": 0.0,
-                "silent_segments": [],
-                "long_silence_count": 0,
-                "speech_activity_percent": 0.0,
-                "audio_duration": 0.0,
-                "error": str(e)
-            }
+            print(f"魔搭识别失败：{e}")
     
-    @staticmethod
-    def calculate_hesitation_score(silence_analysis: Dict) -> float:
-        """计算犹豫分数（基于沉默模式）"""
-        if not silence_analysis:
-            return 0.0
+    # 本地环境，用简单方法
+    try:
+        import speech_recognition as sr
         
-        long_silence_count = silence_analysis.get("long_silence_count", 0)
-        silence_ratio = silence_analysis.get("silence_ratio", 0.0)
+        print("使用本地语音识别...")
+        r = sr.Recognizer()
         
-        # 基于长沉默次数和沉默比例计算犹豫分数（0-10分，越高越犹豫）
-        hesitation_score = (long_silence_count * 2) + (silence_ratio * 5)
+        with sr.AudioFile(audio_path) as source:
+            audio = r.record(source)
         
-        return min(round(hesitation_score, 1), 10.0)
+        text = r.recognize_google(audio, language='zh-CN')
+        print(f"识别结果：{text}")
+        return text
+        
+    except Exception as e:
+        print(f"本地识别失败：{e}")
+        return ""
 
-class SpeechToText:
-    """语音转文字"""
+#文字转语音函数 
+def text_to_speech_simple(text, output_path=None):
+    if not text:
+        print("错误：没有文字内容")
+        return None
     
-    @staticmethod
-    def transcribe(audio_data: bytes, use_api: bool = False) -> str:
-        if not audio_data:
-            return ""
+    # 如果在魔搭社区
+    if IS_MODELSCOPE:
+        try:
+            from modelscope.pipelines import pipeline
+            from modelscope.utils.constant import Tasks
             
-        if use_api:
-            try:
-                import openai
-                
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
-                    tmp.write(audio_data)
-                    tmp_path = tmp.name
-                
-                with open(tmp_path, 'rb') as audio_file:
-                    transcript = openai.Audio.transcribe(
-                        model="whisper-1",
-                        file=audio_file
-                    )
-                
-                os.unlink(tmp_path)
-                
-                return transcript.text
-                
-            except ImportError:
-                logger.warning("未安装openai库，使用本地模式")
-            except Exception as e:
-                logger.error(f"Whisper API调用失败: {e}")
+            print("使用魔搭语音合成模型...")
+            tts_pipeline = pipeline(
+                task=Tasks.text_to_speech,
+                model='damo/speech_sambert-hifigan_tts_zh-cn_16k'
+            )
+            
+            # 如果没有指定输出路径，创建临时文件
+            if output_path is None:
+                temp_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+                output_path = temp_file.name
+            output = tts_pipeline(text, voice='zhitian_emo')
+            output.save(output_path)
+            
+            print(f"语音已保存到：{output_path}")
+            return output_path
+            
+        except Exception as e:
+            print(f"魔搭语音合成失败：{e}")
+    
+    # 本地环境
+    try:
+        from gtts import gTTS
+        import pygame
         
-        # 本地模式：返回模拟结果
-        logger.warning("使用模拟语音识别，实际项目应集成真实ASR")
+        print("使用本地语音合成...")
         
-        mock_responses = [
-            "我对Python有深入的了解，特别是在后端开发方面。",
-            "我最近的项目是一个微服务架构的电商系统。",
-            "我熟悉Django和Flask框架，并有实际项目经验。",
-            "在数据库方面，我使用过MySQL和Redis。",
-            "我对分布式系统和高并发处理有一定经验。"
-        ]
-        
-        import random
-        return random.choice(mock_responses)
+        #创建临时文件
+        if output_path is None:
+            temp_file = tempfile.NamedTemporaryFile(suffix='.mp3', delete=False)
+            output_path = temp_file.name
 
-class TextToSpeech:
-    """文字转语音"""
-    
-    @staticmethod
-    def synthesize(text: str, use_api: bool = False) -> Optional[bytes]:
-        if not text:
-            return None
-            
-        if use_api:
-            try:
-                logger.info(f"TTS API转换: {text[:50]}...")
-                return b'mock_audio_data'
-            except Exception as e:
-                logger.error(f"TTS API调用失败: {e}")
+        tts = gTTS(text=text, lang='zh-cn')
+        tts.save(output_path)
         
-        logger.warning("使用模拟TTS，实际项目应集成真实TTS")
+        pygame.mixer.init()
+        pygame.mixer.music.load(output_path)
+        pygame.mixer.music.play()
+        
+        print(f"语音已保存到：{output_path}")
+        return output_path
+        
+    except Exception as e:
+        print(f"本地语音合成失败：{e}")
         return None
 
-class AudioProcessor:
-    """音频处理器"""
+def record_audio(duration=5, sample_rate=16000):
+
+    try:
+        import pyaudio
+        import wave
+        
+        print(f"开始录音 {duration} 秒...")
+        
+        # 录音参数
+        chunk = 1024
+        format = pyaudio.paInt16
+        channels = 1
+        
+        # 创建PyAudio实例
+        p = pyaudio.PyAudio()
+        
+        # 创建临时文件
+        temp_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+        temp_path = temp_file.name
+        temp_file.close()
+        
+        # 开始录音
+        stream = p.open(
+            format=format,
+            channels=channels,
+            rate=sample_rate,
+            input=True,
+            frames_per_buffer=chunk
+        )
+        
+        frames = []
+        for i in range(0, int(sample_rate / chunk * duration)):
+            data = stream.read(chunk)
+            frames.append(data)
+        
+        print("录音结束")
+        
+        # 停止录音
+        stream.stop_stream()
+        stream.close()
+        p.terminate()
+        
+        # 保存为WAV文件
+        wf = wave.open(temp_path, 'wb')
+        wf.setnchannels(channels)
+        wf.setsampwidth(p.get_sample_size(format))
+        wf.setframerate(sample_rate)
+        wf.writeframes(b''.join(frames))
+        wf.close()
+        
+        return temp_path
+        
+    except Exception as e:
+        print(f"录音失败：{e}")
+        return None
+def process_voice_interview():
+    import time
     
-    def __init__(self):
-        self.recorder = AudioRecorder()
-        self.stt = SpeechToText()
-        self.tts = TextToSpeech()
-        self.analyzer = SilenceAnalyzer()
+    print("=" * 50)
+    print("开始语音面试")
+    print("=" * 50)
+    
+    position = input("请输入面试岗位（默认Python开发）: ") or "Python开发"
+    interview_mode = True
+    history = []
+    scores = []
+    question_count = 0
+    
+    print(f"\n开始{position}面试，请准备回答问题...")
+    
+    # 生成欢迎语（文字）
+    welcome_prompt = f"作为{position}面试官，请做简短开场、自我介绍并问第一个技术问题"
+    welcome_response = ""
+    for text in llm_stream_chat([], welcome_prompt, interview_mode=True, position=position):
+        welcome_response = text
+    
+    print(f"面试官: {welcome_response}")
+    
+    # 把欢迎语加入历史
+    history.append({"role": "assistant", "content": welcome_response})
+    
+    # 把欢迎语转为语音播放
+    print("正在播放欢迎语...")
+    tts_path = text_to_speech_simple(welcome_response)
+    if tts_path:
+        print("语音播放完成")
+    
+    # 面试循环
+    while True:
+        print("\n" + "=" * 30)
+        print(f"第{question_count + 1}个问题")
         
-    def record_and_transcribe(self, duration: int = 5) -> Tuple[str, bytes, Dict]:
-        """
-        录制并转文字
+
+        print("\n请开始回答（5秒后自动结束）...")
+        audio_path = record_audio(duration=5)
         
-        Returns:
-            (转录文字, 音频数据, 沉默分析结果)
-        """
-        if not AUDIO_VIDEO_CONFIG.enable_audio:
-            logger.warning("音频功能未启用")
-            return "", b'', {}
-        
-        if not self.recorder.start_recording():
-            return "", b'', {}
-        
-        time.sleep(duration)
-        
-        audio_data = self.recorder.stop_recording()
-        
-        if not audio_data:
-            return "", b'', {}
+        if not audio_path:
+            print("录音失败，请重试")
+            continue
         
         # 语音转文字
-        text = self.stt.transcribe(audio_data)
+        print("正在识别语音...")
+        user_text = speech_to_text(audio_path)
         
-        # 分析沉默模式
-        silence_analysis = self.analyzer.analyze_silence_patterns(
-            audio_data, AUDIO_VIDEO_CONFIG.sample_rate
-        )
+        if not user_text:
+            print("语音识别失败，请重说一次")
+            continue
         
-        return text, audio_data, silence_analysis
-    
-    def analyze_audio_silence(self, audio_data: bytes) -> Dict:
-        """分析音频沉默模式"""
-        return self.analyzer.analyze_silence_patterns(
-            audio_data, AUDIO_VIDEO_CONFIG.sample_rate
-        )
-    
-    def text_to_speech(self, text: str) -> Optional[bytes]:
-        """文字转语音"""
-        if not AUDIO_VIDEO_CONFIG.enable_audio:
-            return None
-            
-        return self.tts.synthesize(text)
-    
-    def save_interview_audio(self, audio_segments: list, output_path: str) -> bool:
-        """保存面试音频"""
-        try:
-            combined_data = b''.join(audio_segments)
-            return self.recorder.save_to_wav(combined_data, output_path)
-        except Exception as e:
-            logger.error(f"保存面试音频失败: {e}")
-            return False
-    
-    def cleanup(self):
-        """清理资源"""
-        self.recorder.cleanup()
+        print(f"你的回答: {user_text}")
+        
+        # 3. 评估回答
+        print("正在评估回答...")
+        evaluation_result = None
+        for result in llm_stream_chat(history, user_text, 
+                                     interview_mode=True, 
+                                     position=position,
+                                     evaluate_mode=True):
+            evaluation_result = result
+        
+        if evaluation_result:
+            score = evaluation_result["score"]
+            feedback = evaluation_result["feedback"]
+            scores.append(score)
+            print(f"评分: {score}/5.0 - {feedback}")
+        
+        history.append({"role": "user", "content": user_text})
+        
+        print("\nAI思考中...")
+        ai_response = ""
+        
+        need_followup, _ = should_followup_simple(user_text, len(history))
+        
+        for text in llm_stream_chat(history, "", 
+                                   interview_mode=True,
+                                   position=position,
+                                   followup_mode=need_followup):
+            ai_response = text
+       
+            print(f"\rAI: {text}", end="")
+        
+        print(f"\nAI回复: {ai_response}")
+        
 
-# 全局音频处理器实例
-audio_processor = AudioProcessor()
+        history.append({"role": "assistant", "content": ai_response})
+        
+        print("正在生成语音回复...")
+        tts_path = text_to_speech_simple(ai_response)
+        if tts_path:
+            print("语音回复播放完成")
+        else:
+            print("语音生成失败，但对话继续")
+        
+        question_count += 1
+        if question_count >= 5:  # 最多问5个问题
+            print("\n已达到最大问题数量")
+            break
+        
+        continue_interview = input("\n继续下一个问题吗？(y/n): ").lower()
+        if continue_interview != 'y':
+            break
+
+    print("\n" + "=" * 50)
+    print("面试结束，正在生成总结...")
+    
+    summary = get_interview_summary(position, question_count, scores)
+    print(summary)
+    
+    print("\n正在播放面试总结...")
+    tts_path = text_to_speech_simple(summary)
+    if tts_path:
+        print("总结语音播放完成")
+    
+    print("=" * 50)
+    print("语音面试流程结束")
+    print("=" * 50)
+    
+    # 保存面试记录
+    try:
+        with open(f"interview_record_{int(time.time())}.json", "w", encoding="utf-8") as f:
+            record = {
+                "position": position,
+                "question_count": question_count,
+                "scores": scores,
+                "history": history,
+                "summary": summary,
+                "timestamp": time.time()
+            }
+            json.dump(record, f, ensure_ascii=False, indent=2)
+        print(f"面试记录已保存")
+    except Exception as e:
+        print(f"保存记录失败: {e}")
