@@ -1,3 +1,97 @@
+#这里处理TTS和ASR的api调用
+# modules/audio_processor.py
+from openai import OpenAI
+import os
+import re
+from pathlib import Path
+from openai import OpenAI
+ 
+# 永远不要在代码里写死绝对路径，尤其是带中文的(血的教训)
+# 这里保留为空或默认值即可，实际由 app.py 控制
+speech_file_path = "temp_audio_test.mp3" 
+
+class TTS_no_stream:
+    def __init__(self, api_key):
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.stepfun.com/v1"
+        )
+        self.default_voice = "cixingnansheng"
+
+    def to_speech(self, text, output_path):
+        """
+        output_path: 必须是完整的文件路径 (str 或 Path 对象)
+        """
+        try:
+            # 1. 路径清洗：强制转换为绝对路径，并统一斜杠格式
+            save_path = Path(output_path).resolve()
+            
+            # 🐞 调试打印：看看最终到底存哪儿去了
+            print(f"DEBUG: 正在尝试写入文件 -> {save_path}")
+
+            # 2. 发起请求
+            # ⚠️ 关键修复：暂时注释掉 'style': '严肃'
+            # 如果加上这个还报错，说明 StepFun 的 SDK 在处理 JSON 中文时有 Bug
+            response = self.client.audio.speech.create(
+                model="step-tts-mini",
+                voice=self.default_voice,
+                input=text,
+                extra_body={
+                    "volume": 1.0,
+                    # "voice_label": {    <--- 暂时注释掉这里，排查是不是它的锅
+                        "style": "严肃"
+                    # }
+                }
+            )
+            # 不要用 response.stream_to_file，那个黑盒方法容易出编码问题
+            # 我们用 Python 原生的 'wb' (二进制写入) 模式，兼容性最强
+            with open(save_path, "wb") as f:
+                f.write(response.content)
+            
+            print(f"✅ 音频保存成功")
+            return True
+
+        except Exception as e:
+            print(f"❌ TTS 生成错误: {e}")
+            # 打印错误类型，帮助判断
+            print(f"错误类型: {type(e)}")
+            return False
+
+# 下面的 chunking_tool 保持不变...
+def chunking_tool(text):
+    """
+    将 AI 生成的文本流切分为完整的句子，以便触发实时 TTS。
+    架构思考：此函数通常位于 modules/audio_processor.py 中，作为 TTS 流的前置过滤。
+    """
+    # 1. 定义断句标点：句号、问号、感叹号（包含中英文）
+    # 2. 使用正则表达式进行切分，捕获组 () 确保标点符号被保留在列表中
+    punc_list = r'([。！？.?!\n])'
+    
+    # 初始切分
+    raw_chunks = re.split(punc_list, text)
+    
+    combined_chunks = []
+    # 3. 将标点符号合并回前面的句子
+    for i in range(0, len(raw_chunks) - 1, 2):
+        sentence = raw_chunks[i].strip()
+        punctuation = raw_chunks[i+1]
+        if sentence:
+            combined_chunks.append(f"{sentence}{punctuation}")
+    
+    # 处理最后一段可能没有标点的文字（LLM 正在生成中）
+    if len(raw_chunks) % 2 == 1:
+        last_chunk = raw_chunks[-1].strip()
+        if last_chunk:
+            combined_chunks.append(last_chunk)
+            
+    return combined_chunks
+
+
+
+
+
+
+
 # audio_processor.py - 修复版本
 import asyncio
 import aiohttp
@@ -192,57 +286,3 @@ async def transcribe_file(file_path: str, api_key: str) -> Optional[str]:
     
     print(f"处理文件: {file_path}")
     return await audio_to_text(file_path, api_key)
-# modules/audio_processor.py
-from openai import OpenAI
-import os
-
-"""class AudioProcessor:
-    def __init__(self, api_key, base_url="https://api.stepfun.com/v1"):
-        self.api_key='6pZ3jWJGHoMXAcZZpjF3ierYzYDqHEpQLU9gK6auHIWhB1uthsLfqUAnzGLcBiW5x'
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
-
-    def text_to_speech(self, text, voice="cixingnansheng"):
-        try:
-            response = self.client.audio.speech.create(
-                model="step-tts-mini", # 追求实时性建议用 mini 版
-                voice=voice,
-                input=text,
-                response_format="mp3" # 常见的格式，Streamlit 易于播放
-            )
-            # 直接返回二进制内容，方便 Streamlit 处理
-            return response.content 
-        except Exception as e:
-            print(f"TTS Error: {e}")
-            return None"""
-
-from pathlib import Path
-from openai import OpenAI
- 
-speech_file_path = r"C:\Users\Jason骆\Desktop\audio_TTS_test\test_interview.mp3" #暂时先这样写吧
- 
-client = OpenAI(
-api_key="6pZ3jWJGHoMXAcZZpjF3ierYzYDqHEpQLU9gK6auHIWhB1uthsLfqUAnzGLcBiW5x",
-base_url="https://api.stepfun.com/v1"
-)
-response = client.audio.speech.create(
-model="step-tts-2",
-voice="cixingnansheng",
-input="我是面试官，请问你是来面试什么职位的呢", #输入的文本
-extra_body={
-  "volume":1.0 ,# volume 在拓展参数里
-  "voice_label":{
-    #"language": "粤语", # 可选：语言
-    #"emotion": "严肃", # 可选：情感
-    "style": "严肃" # 可选：说话语速
-  },
-  "pronunciation_map":{
-    "tone":[
-      "阿胶/e1胶",
-      "扁舟/偏舟",
-      "LOL/laugh out loudly"
-      ]
-  }
-}
-)
-response.stream_to_file(speech_file_path)
- 

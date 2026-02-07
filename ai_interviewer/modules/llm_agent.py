@@ -2,6 +2,7 @@
 #history 在app.py中存储，然后在app.py中调用这里的llm_stream_chat函数，实现流式输出
 import os
 from openai import OpenAI
+import re
 
 client = OpenAI(
     # 若没有配置环境变量，请用百炼API Key将下行替换为：api_key="sk-xxx"
