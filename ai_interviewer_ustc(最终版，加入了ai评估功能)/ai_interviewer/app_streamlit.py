@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-AI 面试官 - Streamlit 前端
-方案：专业会客厅 - 浅灰/米白背景、深灰正文、深蓝强调，卡片式对话与留白。
+AI 面试官 - Streamlit 前端（多主题版本）
+支持三种科技感主题：赛博训练舱、未来终端、霓虹实验室
 """
 import asyncio
 import json
@@ -30,6 +30,7 @@ from modules.audio_processor import (
     transcribe_file,
 )
 from modules.ai_report import ai_report_stream, _format_history_for_report
+from themes import get_theme_css, get_theme_list
 
 # -----------------------------------------------------------------------------
 # 1. 页面配置
@@ -44,81 +45,15 @@ st.set_page_config(
 init_directories()
 
 # -----------------------------------------------------------------------------
-# 2. 自定义 CSS（专业会客厅风格）
+# 2. 主题选择（在侧边栏之前初始化）
 # -----------------------------------------------------------------------------
-st.markdown(
-    """
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
-    <style>
-        .stApp {
-            background-color: #f5f5f0;
-        }
-        [data-testid="stSidebar"] {
-            background-color: #ffffff;
-            border-right: 1px solid #e9ecef;
-        }
-        [data-testid="stSidebar"] .stMarkdown { font-family: 'Noto Sans SC', 'Inter', sans-serif; }
-        .stApp .main .block-container {
-            padding-top: 1.5rem;
-            padding-bottom: 2rem;
-            max-width: 1100px;
-        }
-        h1, h2, h3 {
-            color: #2c3e50;
-            font-family: 'Noto Sans SC', 'Inter', sans-serif;
-        }
-        p, .stMarkdown { font-size: 16px; line-height: 1.5; }
-        .chat-card-user {
-            background: linear-gradient(135deg, #2c5f7a 0%, #3d7a94 100%);
-            color: #fff;
-            border-radius: 12px;
-            padding: 14px 18px;
-            margin: 10px 0;
-            margin-left: 15%;
-            box-shadow: 0 2px 8px rgba(44,95,122,0.2);
-        }
-        .chat-card-assistant {
-            background: #ffffff;
-            border: 1px solid #e9ecef;
-            border-radius: 12px;
-            padding: 14px 18px;
-            margin: 10px 0;
-            margin-right: 15%;
-            box-shadow: 0 2px 6px rgba(0,0,0,0.04);
-        }
-        .chat-card-assistant p { margin: 0; color: #2c3e50; }
-        .chat-card-user p { margin: 0; }
-        #MainMenu { visibility: hidden; }
-        footer { visibility: hidden; }
-        .rag-card {
-            background: #ffffff;
-            border-left: 4px solid #2c5f7a;
-            border-radius: 8px;
-            padding: 12px 16px;
-            margin: 8px 0;
-            box-shadow: 0 1px 4px rgba(0,0,0,0.06);
-        }
-        .rag-card .rag-query {
-            color: #2c5f7a;
-            font-weight: 600;
-            font-size: 14px;
-            margin-bottom: 6px;
-        }
-        .rag-card .rag-content {
-            color: #2c3e50;
-            font-size: 13px;
-            line-height: 1.6;
-            white-space: pre-wrap;
-        }
-        .rag-meta {
-            color: #95a5a6;
-            font-size: 12px;
-            margin-top: 4px;
-        }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+if "selected_theme" not in st.session_state:
+    st.session_state.selected_theme = "赛博训练舱"  # 默认主题
+
+# -----------------------------------------------------------------------------
+# 3. 应用选中的主题 CSS
+# -----------------------------------------------------------------------------
+st.markdown(get_theme_css(st.session_state.selected_theme), unsafe_allow_html=True)
 
 
 def run_async(coro):
@@ -170,8 +105,25 @@ if "report_generating" not in st.session_state:
 # 4. 侧边栏
 # -----------------------------------------------------------------------------
 with st.sidebar:
-    st.title("面试官设置")
+    st.title("🎨 AI 面试官")
+    
+    # 主题选择器（放在最顶部）
+    st.markdown("### 视觉主题")
+    theme_choice = st.selectbox(
+        "选择界面风格",
+        options=get_theme_list(),
+        index=get_theme_list().index(st.session_state.selected_theme),
+        help="切换不同的科技感主题风格",
+        label_visibility="collapsed"
+    )
+    
+    # 如果主题改变，更新并重新加载
+    if theme_choice != st.session_state.selected_theme:
+        st.session_state.selected_theme = theme_choice
+        st.rerun()
+    
     st.markdown("---")
+    st.markdown("### 面试官设置")
 
     # 预设提示词选择
     prompt_choice = st.selectbox(
