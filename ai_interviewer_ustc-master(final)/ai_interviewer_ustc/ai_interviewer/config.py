@@ -6,15 +6,27 @@ import os
 from pathlib import Path
 
 # ==================== API 密钥配置 ====================
-# StepFun API (用于 TTS 和 ASR)
-STEPFUN_API_KEY = os.getenv("STEPFUN_API_KEY", "6pZ3jWJGHoMXAcZZpjF3ierYzYDqHEpQLU9gK6auHIWhB1uthsLfqUAnzGLcBiW5x")
+# StepFun API (用于 TTS 和 ASR) - 8 个 Key 轮询
+STEPFUN_API_KEYS = [
+    os.getenv("STEPFUN_API_KEY_1", "6pZ3jWJGHoMXAcZZpjF3ierYzYDqHEpQLU9gK6auHIWhB1uthsLfqUAnzGLcBiW5x"),
+    os.getenv("STEPFUN_API_KEY_2", "3ZrwQrJ6sG8i2AhNs89yejHYABzGnlT6pMpXaVxr1UDb4iSOQBeRzMwotRFXo3vP7"),  # 添加第 2 个 Key
+    os.getenv("STEPFUN_API_KEY_3", "4eZ2G2tgOlbaI3MfB54mDuCTpbreWWGjaUtMSTP42IsUHkbS8xkcQ1Zf9hqs6DGlt"),  # 添加第 3 个 Key
+    os.getenv("STEPFUN_API_KEY_4", "5FD40mZBI8s0NZx3NfOGpbLVDgWMUCGJwXxoxgxtm6GDpk7agpoRmkYtWTOSLWvCt"),  # 添加第 4 个 Key
+    os.getenv("STEPFUN_API_KEY_5", "50yWwsj0tsPglPPudVPGCHuivWP3kukyUTPaMNesmNzolxAOeBl6yktwS66GbUsQ"),  # 添加第 5 个 Key
+    os.getenv("STEPFUN_API_KEY_6", "7voYNQ6OdRV78nqvmaNEOTUOsvOr5vQDpf1QsDNWhdFHntWD9V2Dc61Qc9gcVD3Vm"),  # 添加第 6 个 Key
+    os.getenv("STEPFUN_API_KEY_7", "63AhrV0IbjdbVbFQVUqqCQJOQSuyJ3n9nUn3LXnNSZdBxKo2JLswf7qIXFEFn3ilp"),  # 添加第 7 个 Key
+    os.getenv("STEPFUN_API_KEY_8", "6cqW4gyXcWs2nVypU2jw3p6coQK9ZgG9Cj9UQtU0SrlIFtuwUvRSwimLMniD57t5G"),  # 添加第 8 个 Key
+]
+
+# 兼容旧代码（使用第一个 Key）
+STEPFUN_API_KEY = STEPFUN_API_KEYS[0]
 
 # 阿里云 DashScope API (用于 LLM)
 DASHSCOPE_API_KEY ="sk-af8e9af4aae340bd86178117f7f3f33c" #os.getenv("DASHSCOPE_API_KEY", "sk-af8e9af4aae340bd86178117f7f3f33c")
 
 # ==================== 模型配置 ====================
 # LLM 模型
-LLM_MODEL = "qwen-plus"
+LLM_MODEL = "qwen-turbo"
 LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 # TTS 模型
