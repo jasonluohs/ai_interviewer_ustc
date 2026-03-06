@@ -5,7 +5,9 @@ AI 面试官 - Streamlit 前端
 """
 import asyncio
 import json
+import queue
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -25,11 +27,13 @@ from config import (
 from modules.llm_agent import llm_stream_chat
 from modules.rag_engine import get_retrieved_context
 from modules.audio_processor import (
-    TTS_no_stream,
-    chunking_tool,
+    StreamingTTSManager,
     transcribe_file,
 )
 from modules.ai_report import ai_report_stream, _format_history_for_report
+
+# 导入流式音频组件
+from components.streaming_audio import streaming_audio_player
 
 # -----------------------------------------------------------------------------
 # 1. 页面配置
@@ -243,8 +247,14 @@ if "enable_tts" not in st.session_state:
     st.session_state.enable_tts = True
 if "audio_processed_token" not in st.session_state:
     st.session_state.audio_processed_token = None
-if "last_tts_path" not in st.session_state:
-    st.session_state.last_tts_path = None
+if "tts_audio_queue" not in st.session_state:
+    st.session_state.tts_audio_queue = []  # 流式 TTS 音频队列
+if "temp_audio_buffer" not in st.session_state:
+    st.session_state.temp_audio_buffer = []  # 临时音频缓冲区（用于排序）
+if "current_audio_index" not in st.session_state:
+    st.session_state.current_audio_index = 0  # 当前播放索引
+if "new_audio_available" not in st.session_state:
+    st.session_state.new_audio_available = False  # 标记是否有新音频可播放
 # RAG 相关状态
 if "enable_rag" not in st.session_state:
     st.session_state.enable_rag = True
@@ -345,15 +355,18 @@ with st.sidebar:
     st.markdown("---")
     if st.button("新对话", use_container_width=True):
         # 清理上一段 TTS 文件
-        old_tts = st.session_state.get("last_tts_path")
-        if old_tts and Path(old_tts).exists():
-            try:
-                Path(old_tts).unlink(missing_ok=True)
-            except Exception:
-                pass
+        old_queue = st.session_state.get("tts_audio_queue", [])
+        for old_audio in old_queue:
+            if Path(old_audio).exists():
+                try:
+                    Path(old_audio).unlink(missing_ok=True)
+                except Exception:
+                    pass
         st.session_state.history = []
         st.session_state.audio_processed_token = None
-        st.session_state.last_tts_path = None
+        st.session_state.tts_audio_queue = []
+        st.session_state.temp_audio_buffer = []  # 清空临时缓冲区
+        st.session_state.current_audio_index = 0
         st.session_state.rag_history = []
         st.session_state.ai_report_text = ""
         st.session_state.report_generating = False
@@ -430,10 +443,21 @@ with tab_voice:
     else:
         st.info("点击上方麦克风开始语音面试")
 
-    # TTS 自动播放（autoplay=True 无需手动点击播放按钮）
-    last_tts = st.session_state.get("last_tts_path")
-    if last_tts and Path(last_tts).exists():
-        st.audio(last_tts, format="audio/mp3", autoplay=True)
+    # ========== 流式音频播放（HTML5 音频队列） ==========
+    # 🚀 关键优化：有新音频时立即触发播放
+    if st.session_state.get("tts_audio_queue") and len(st.session_state.tts_audio_queue) > 0:
+        # 🚨 调试：显示当前队列中的音频数量
+        print(f"🔊 准备播放：队列中有 {len(st.session_state.tts_audio_queue)} 句音频")
+        
+        # 检查是否有新音频可用
+        if st.session_state.get("new_audio_available", False):
+            # 有新音频，触发页面刷新以播放
+            st.session_state.new_audio_available = False
+            st.rerun()  # 立即刷新，触发播放器更新
+        
+        # 在语音 Tab 中显示播放器
+        streaming_audio_player(st.session_state.tts_audio_queue, key=f"audio_{len(st.session_state.tts_audio_queue)}")
+    # ====================================================
 
 # ---------- Tab 2: 文字对话 ----------
 with tab_chat:
@@ -630,38 +654,144 @@ if user_input:
                         "top_k": st.session_state.rag_top_k,
                     })
 
+            # ========== 流式 TTS 初始化 ==========
+            if st.session_state.enable_tts:
+                # 创建流式 TTS 管理器（自动使用轮询的 API Key）
+                streaming_tts = StreamingTTSManager()
+                streaming_tts.start()
+                st.session_state.streaming_tts = streaming_tts
+                st.session_state.tts_audio_queue = []
+                st.session_state.current_audio_index = 0
+            # ======================================
+
+            full_response = ""
+            previous_response = ""
+            
             for partial in llm_stream_chat(
                 st.session_state.history[:-1],
                 user_input,
                 system_prompt=augmented_system_prompt,
             ):
                 full_response = partial
+                
+                # 计算新增的文本（增量）
+                new_text = full_response[len(previous_response):]
+                previous_response = full_response
+                
                 reply_placeholder.markdown(
                     f'<div class="chat-card-assistant"><p>{full_response}</p></div>',
                     unsafe_allow_html=True,
                 )
+                
+                # ========== 流式 TTS：后台生成 ==========
+                if st.session_state.enable_tts and st.session_state.streaming_tts:
+                    # 只将新增的文本添加到管理器（后台生成）
+                    if new_text.strip():
+                        st.session_state.streaming_tts.add_text(new_text)
+                    
+                    # 从 completed_queue 获取已生成的音频（带 counter 保证顺序）
+                    # 🚨 关键：不立即添加到队列，先存到临时列表
+                    if "temp_audio_buffer" not in st.session_state:
+                        st.session_state.temp_audio_buffer = []
+                    
+                    try:
+                        while True:
+                            counter, sentence, audio_path = st.session_state.streaming_tts.completed_queue.get_nowait()
+                            st.session_state.temp_audio_buffer.append((counter, sentence, audio_path))
+                            # 调试信息
+                            print(f"✅ 后台生成 #{counter}: {sentence[:30]}...")
+                    except queue.Empty:
+                        pass  # 没有新的音频
+                    
+                    # 🚀 关键：不调用 st.rerun()，让 LLM 继续流式输出
+                # ==========================================
         except Exception as e:
-            full_response = f"抱歉，系统出现了点小故障: {str(e)}"
+            full_response = f"抱歉，系统出现了点小故障：{str(e)}"
             reply_placeholder.markdown(
                 f'<div class="chat-card-assistant"><p>{full_response}</p></div>',
                 unsafe_allow_html=True,
             )
     st.session_state.history.append({"role": "assistant", "content": full_response})
 
-    # TTS：生成语音，语音 Tab 会自动播放
-    if st.session_state.enable_tts and full_response and not full_response.startswith("抱歉"):
-        with st.spinner("正在生成语音..."):
-            tts = TTS_no_stream(STEPFUN_API_KEY)
-            temp_mp3 = TEMP_DIR / f"{uuid4().hex}.mp3"
-            if tts.to_speech(full_response, str(temp_mp3)):
-                old_tts = st.session_state.get("last_tts_path")
-                if old_tts and old_tts != str(temp_mp3) and Path(old_tts).exists():
-                    try:
-                        Path(old_tts).unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                st.session_state.last_tts_path = str(temp_mp3)
-            else:
-                st.error("语音生成失败，请检查网络或 API 配置。")
+    # ========== 流式 TTS：结束处理 ==========
+    if st.session_state.enable_tts and st.session_state.streaming_tts:
+        # 强制处理缓冲区剩余文本
+        st.session_state.streaming_tts.flush()
+        
+        # 显示进度提示
+        progress_placeholder = st.empty()
+        progress_placeholder.info("⏳ 正在等待所有语音生成完成...")
+        
+        # 🚀 关键优化：等待所有句子都生成完成
+        start_time = time.time()
+        max_wait = 60  # 最多等待 60 秒
+        
+        while time.time() - start_time < max_wait:
+            # 收集已生成的音频到临时缓冲区
+            try:
+                while True:
+                    counter, sentence, audio_path = st.session_state.streaming_tts.completed_queue.get_nowait()
+                    st.session_state.temp_audio_buffer.append((counter, sentence, audio_path))
+                    print(f"✅ 收集到音频 #{counter}: {sentence[:30]}...")
+            except queue.Empty:
+                pass
+            
+            # 检查是否所有句子都处理完了
+            queue_empty = st.session_state.streaming_tts.sentence_queue.empty()
+            
+            # 更新进度
+            current_count = len(st.session_state.temp_audio_buffer)
+            progress_placeholder.info(f"⏳ 已生成 {current_count} 句语音...")
+            
+            if queue_empty:
+                # 队列空了，再等待 1 秒确保没有遗漏
+                time.sleep(1.0)
+                # 再检查一次
+                try:
+                    while True:
+                        counter, sentence, audio_path = st.session_state.streaming_tts.completed_queue.get_nowait()
+                        st.session_state.temp_audio_buffer.append((counter, sentence, audio_path))
+                        print(f"✅ 最终收集 #{counter}: {sentence[:30]}...")
+                except queue.Empty:
+                    pass
+                break  # 完成
+            
+            time.sleep(0.3)
+        
+        # 🚨 关键：所有收集完成后，统一按 counter 排序
+        if "temp_audio_buffer" in st.session_state and st.session_state.temp_audio_buffer:
+            # 按 counter 排序
+            st.session_state.temp_audio_buffer.sort(key=lambda x: x[0])
+            
+            # 🚨 调试：显示排序结果
+            print(f"🔍 最终排序 counters: {[x[0] for x in st.session_state.temp_audio_buffer]}")
+            print(f"🔍 最终排序句子预览：{[x[1][:20] for x in st.session_state.temp_audio_buffer]}")
+            
+            # 添加到主队列
+            for counter, sentence, audio_path in st.session_state.temp_audio_buffer:
+                st.session_state.tts_audio_queue.append(audio_path)
+                print(f"  📝 添加到队列 #{counter}: {sentence[:30]}...")
+            
+            print(f"✅ 最终排序完成：共 {len(st.session_state.temp_audio_buffer)} 句")
+            
+            # 清空临时缓冲区
+            st.session_state.temp_audio_buffer = []
+        
+        # 停止工作线程
+        st.session_state.streaming_tts.stop()
+        st.session_state.streaming_tts = None
+        
+        # 🚀 关键：标记有新音频可用（触发自动播放）
+        st.session_state.new_audio_available = True
+        
+        # 显示最终进度
+        total_sentences = len(st.session_state.tts_audio_queue)
+        if total_sentences > 0:
+            progress_placeholder.success(f"✅ 语音生成完成！共 {total_sentences} 句，正在播放...")
+            time.sleep(2)
+            progress_placeholder.empty()
+        else:
+            progress_placeholder.warning("⚠️ 未生成任何语音")
+    # ========================================
 
     st.rerun()
